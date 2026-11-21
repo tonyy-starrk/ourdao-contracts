@@ -1,6 +1,6 @@
 # LoanPolicy Parameter Guide
 
-`LoanPolicy` has twelve tunable parameters that control who can borrow, how
+`LoanPolicy` has thirteen tunable parameters that control who can borrow, how
 much, at what rate, and what happens when a loan goes wrong. This document
 explains each parameter: what it controls, its units, its interactions with
 other parameters, and a suggested starting value.
@@ -13,26 +13,30 @@ pathological combinations explicitly.
 ## Parameter reference
 
 ### `min_membership_duration: u64`
-**Units:** seconds since Unix epoch, stored in `Member.join_time`.
+**Units:** seconds. It is compared with the elapsed time since
+`Member.join_time`.
 **What it controls:** How long a member must have been in the DAO before
 they can request a loan.  
 **Interactions:** Read against `member.join_time` at loan-request time.
 Setting this above the typical membership age of your DAO members will make
 lending impossible in practice until enough time has passed.  
-**Suggested start:** `2_592_000` (30 days). Long enough to filter drive-by
-borrowers; short enough not to strand early members.
+**Safe range:** `0..=2_592_000` seconds (30 days).
+**Example:** `2_592_000` (30 days), long enough to filter drive-by borrowers
+without indefinitely excluding early members.
 
 ---
 
 ### `membership_contribution: i128`
-**Units:** token stroops (the DAO's native token, smallest unit).  
+**Units:** base-token stroops (the base token's smallest unit).
 **What it controls:** The minimum contribution a member must have on record
 to be eligible for a loan. Set this to the membership fee to require that a
 member has not been slashed below the threshold.  
 **Interactions:** Read against `member.contribution` at loan-request time.
 If a member's contribution has been reduced by a default penalty, they may
 fall below this threshold.  
-**Suggested start:** equal to the membership fee (e.g., `1_000`).
+**Safe range:** Positive `i128` values; the policy validator requires a value
+greater than zero.
+**Example:** `1_000` stroops when that is the membership fee.
 
 ---
 
@@ -43,23 +47,32 @@ fall below this threshold.
 boundary on how long a defaulted loan can sit before it becomes markable.
 A very long `max_loan_duration` plus a long `grace_period` can leave bad
 debt open for years.  
-**Suggested start:** `2_592_000` (30 days).  
+**Safe range:** `1..=u64::MAX`; policy validation requires a non-zero value
+but does not impose an upper bound.
+**Example:** `2_592_000` (30 days).
 **Validation:** Must be non-zero. `validate_policy` does not cap this, so
 choose carefully.
 
 ---
 
-### `min_interest_rate: u32` and `max_interest_rate: u32`
+### `min_interest_rate: u32`
 **Units:** basis points (1 bp = 0.01%; 10_000 bp = 100%).  
-**What they control:** The linear interest-rate curve. A small loan relative
-to the treasury gets `min_interest_rate`; a loan at the maximum ratio gets
-`max_interest_rate`. Any amount in between is interpolated linearly and
-clamped to this range.  
+**What it controls:** The floor of the linear interest-rate curve. Small loans
+relative to the treasury get this rate before utilization-based increases.
+**Safe range:** `0..=10_000`, and it must not exceed `max_interest_rate`.
+**Example:** `500` (5%) as the floor when paired with a 20% ceiling.
+
+---
+
+### `max_interest_rate: u32`
+**Units:** basis points (1 bp = 0.01%; 10_000 bp = 100%).
+**What it controls:** The ceiling of the linear interest-rate curve. Loans at
+the maximum utilization ratio receive this rate; intermediate amounts are
+interpolated linearly from `min_interest_rate`.
 **Interactions:** The property test `loan_terms_rate_stays_within_policy_bounds`
-verifies that the quoted rate is always within `[min, max]`.  
-**Constraint:** `min_interest_rate <= max_interest_rate`; both must be ≤
-10_000 (100%).  
-**Suggested start:** `min = 500` (5%), `max = 2_000` (20%).
+verifies that the quoted rate stays within the configured floor and ceiling.
+**Safe range:** `0..=10_000`, and it must be at least `min_interest_rate`.
+**Example:** `2_000` (20%) as the ceiling when paired with a 5% floor.
 
 ---
 
@@ -69,7 +82,8 @@ verifies that the quoted rate is always within `[min, max]`.
 before requesting another. Read against `member.last_loan_time`.  
 **Interactions:** `last_loan_time` is a Unix timestamp. A `cooldown_period`
 of 0 allows back-to-back borrowing.  
-**Suggested start:** `2_592_000` (30 days). Prevents serial borrowers from
+**Safe range:** `0..=2_592_000` (30 days).
+**Example:** `2_592_000` (30 days). Prevents serial borrowers from
 monopolising treasury liquidity.
 
 ---
@@ -78,9 +92,10 @@ monopolising treasury liquidity.
 **Units:** basis points of the treasury balance at loan-request time.  
 **What it controls:** The ceiling on any single loan as a fraction of the
 live treasury.  
-**Pathological value — `0`:** A ratio of 0 makes **every loan impossible**
-while still passing `validate_policy` (see [#53]). Do not set this to 0.  
-**Suggested start:** `2_000` (20%). Limits exposure to any single borrower.
+**Pathological value — `0`:** A ratio of 0 makes every loan impossible and is
+rejected by policy validation.
+**Safe range:** `1..=10_000` (0.01%–100%).
+**Example:** `2_000` (20%). Limits exposure to any single borrower.
 
 ---
 
@@ -92,7 +107,8 @@ without being defaulted.
 **Interactions:** During a pause, `mark_loan_defaulted` is blocked, so a
 loan can silently pass `due_time + grace_period` and become instantly
 markable on unpause. See [INCIDENT_RUNBOOK.md](./INCIDENT_RUNBOOK.md).  
-**Suggested start:** `259_200` (3 days).
+**Safe range:** `0..=2_592_000` (30 days).
+**Example:** `259_200` (3 days).
 
 ---
 
@@ -103,8 +119,8 @@ is slashed on default. This amount is burned (removed from the treasury's
 accounting of their stake), not redistributed.  
 **Interactions:** Slashing can reduce `member.contribution` below
 `membership_contribution`, making the member ineligible for future loans.  
-**Suggested start:** `2_000` (20%).  
-**Constraint:** Must be ≤ 10_000 (100%).
+**Safe range:** `0..=10_000` (0%–100%).
+**Example:** `2_000` (20%).
 
 ---
 
@@ -115,8 +131,8 @@ before it advances to `Voting`. The borrower can edit terms during this window.
 **Interactions:** `editing_period + voting_period` determines the total elapsed
 time from proposal to decision. Capital is effectively committed during this
 window because `disburse_approved_loan` can only be called after voting closes.  
-**Constraint:** Must be non-zero and ≤ `30 * 24 * 60 * 60` (30 days).  
-**Suggested start:** `259_200` (3 days).
+**Safe range:** `1..=2_592_000` seconds (30 days).
+**Example:** `259_200` (3 days).
 
 ---
 
@@ -124,17 +140,32 @@ window because `disburse_approved_loan` can only be called after voting closes.
 **Units:** seconds.  
 **What it controls:** How long voting is open on a proposal.  
 **Interactions:** See `editing_period` above.  
-**Constraint:** Must be non-zero and ≤ 30 days.  
-**Suggested start:** `259_200` (3 days).
+**Safe range:** `1..=2_592_000` seconds (30 days).
+**Example:** `259_200` (3 days).
 
 ---
 
 ### `treasury_threshold: u32`
 **Units:** basis points of the total weighted vote.  
 **What it controls:** The approval threshold for treasury-withdrawal proposals
-(not loan proposals — those use `consensus_threshold`).  
-**Constraint:** Must be non-zero and ≤ 10_000 (100%).  
-**Suggested start:** `5_100` (51%).
+(not loan proposals — those use `quorum_bps`, falling back to the
+DAO-wide `consensus_threshold` only for an initial/legacy zero setting).
+**Safe range:** `1..=10_000` (0.01%–100%).
+**Example:** `5_100` (51%).
+
+---
+
+### `quorum_bps: u32`
+**Units:** basis points of the total weighted vote (1 bp = 0.01%;
+10_000 bp = 100%).
+**What it controls:** The approval threshold for loan proposals. It is
+independent of `treasury_threshold`, which applies to treasury withdrawals.
+When non-zero, it overrides the DAO-wide `consensus_threshold`; loan proposals
+created under the legacy zero setting fall back to that consensus threshold.
+**Safe range:** `1..=10_000` for proposed policy updates. A zero value is
+accepted in the initial/legacy policy for the fallback behavior, but cannot be
+used in a new policy update.
+**Example:** `5_100` (51%) requires a majority of weighted member votes.
 
 ---
 
@@ -327,7 +358,7 @@ the liquidity needs of its members.
 
 | Combination | Effect |
 |---|---|
-| `max_loan_to_treasury_ratio = 0` | Rejected by `validate_policy`; governance must choose a non-zero exposure ceiling. |
+| `max_loan_to_treasury_ratio = 0` | Rejected by policy validation; governance must choose a non-zero exposure ceiling. |
 | `editing_period + voting_period` > members' patience | Proposals expire before gathering quorum; effective lending rate approaches zero. |
 | `max_loan_duration` >> `default_grace_period` | A defaulted loan can sit in limbo for the full loan duration before anyone can act. |
 | `min_membership_duration` > age of the DAO | No member is old enough to borrow. |
@@ -357,6 +388,7 @@ LoanPolicy {
     editing_period: 259_200,              // 3 days editing
     voting_period: 259_200,               // 3 days voting
     treasury_threshold: 5_100,            // 51% approval for treasury withdrawals
+    quorum_bps: 5_100,                    // 51% approval for loan proposals
 }
 ```
 
@@ -368,8 +400,8 @@ LoanPolicy {
 - 3-day editing + voting keeps decisions moving without rushing members.
 - 3-day grace period gives honest borrowers a short buffer without leaving bad
   debt open for long.
-- 51% threshold for treasury withdrawals matches the consensus threshold,
-  keeping governance consistent.
+- Matching 51% thresholds for treasury withdrawals and loans keeps governance
+  consistent; the two policy fields apply independently to their proposal types.
 
 ---
 
