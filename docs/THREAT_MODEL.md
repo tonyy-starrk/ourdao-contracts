@@ -4,8 +4,8 @@ Status: testnet-stage, **not externally audited**. This document states what the
 
 ## Assets
 
-- Treasury funds held by the contract in the DAO token.
-- Member stakes and accrued yield.
+- Treasury funds held by the contract in the base token and whitelisted assets.
+- Member stakes and accrued yield, which are denominated in the base token.
 - Governance state: proposals, votes, loans, membership records.
 
 ## Actors and trust
@@ -13,15 +13,16 @@ Status: testnet-stage, **not externally audited**. This document states what the
 | Actor | Trusted to | Not trusted to |
 | --- | --- | --- |
 | Admin set | Perform admin-only entrypoints (policy, pause/unpause, migration seeding) and stay online | Move member funds outside the entrypoints' rules |
+| Dedicated pauser | Use the one-way pause authority to stop operations during an emergency | Unpause the DAO or exercise admin powers |
 | Members | Vote and act only for their own address (`require_auth` per call) | Act on another address's behalf |
 | Anyone | Call permissionless entrypoints such as `mark_loan_defaulted`, which is a pure function of ledger time and loan state | Anything else |
-| DAO token contract | Behave as a standard Soroban token | Nothing beyond that; a malicious token is out of scope, the DAO token is chosen at initialization |
+| Whitelisted token contracts | Behave as standard Soroban tokens with exact, honest balance and transfer semantics | Their behavior is not verified by the contract; admins must not treat a successful token probe as an audit |
 | Off-chain backend and frontend | Index and display state | They are not a source of truth; the contract is |
 
 ## Trust assumptions
 
 1. **Admins are honest and available.** Admin keys can pause the contract and set policy within bounds. A compromised admin quorum is the largest single risk. The consensus threshold is set at initialization.
-2. **The DAO token is well behaved.** Balance-changing operations follow checks-effects-interactions, but a token that lies about balances or transfers breaks accounting.
+2. **Every whitelisted token is well behaved.** The contract probes a token's `balance` interface, but this does not establish that transfers are exact or that balances are honest. Fee-on-transfer, rebasing, or malicious tokens can break accounting.
 3. **Migration seeding is trusted.** A migrated deployment relies on admins seeding state truthfully; see [`docs/MIGRATION.md`](./MIGRATION.md#trust-assumption).
 4. **The contract is immutable.** There is no upgrade path, so a bug means migration to a fresh deployment.
 5. **Ledger time is the only clock.** Voting periods, expiry and defaults use ledger timestamps.
@@ -37,6 +38,9 @@ Status: testnet-stage, **not externally audited**. This document states what the
 | Rounding drift in yield | `YieldRemainder` carried forward, property tests |
 | Unbounded storage / cost growth | Document hash size cap, documented membership ceiling and resource costs (#138) |
 | Sybil / vote buying via cheap memberships | See [Sybil and Cheap Membership Attacks](#sybil-and-cheap-membership-attacks) below |
+| Malicious or fee-on-transfer whitelisted token | Admin-only, timelocked additions and a token-interface probe reduce accidental additions; token behavior is not validated. **Open risk:** only whitelist audited, exact-transfer assets. Tracking issue: [#263](https://github.com/tonyy-starrk/ourdao-contracts/issues/263). |
+| Compromised dedicated pauser | The role can pause but cannot unpause, transfer funds, or change admin state; admins must investigate and unpause. **Open liveness risk:** a compromised pauser can keep the DAO paused until an admin intervenes. Keep the pauser key separate and promptly revoke it if compromised. Tracking issue: [#263](https://github.com/tonyy-starrk/ourdao-contracts/issues/263). |
+| Removing a whitelisted token while it still has funds or active loans | Removal blocks new operations in that asset, but does not check balances or outstanding principal; existing loans remain repayable. **Open risk:** verify `get_treasury_accounting(asset)` reports no balance or outstanding principal before removal, or re-whitelist the asset through the timelock to restore access. Tracking issue: [#263](https://github.com/tonyy-starrk/ourdao-contracts/issues/263). |
 
 ## Sybil and Cheap Membership Attacks
 
@@ -83,6 +87,7 @@ If $F$ is nominal (e.g., 1 token) and treasury balance or loan cap is large, $\t
 ## Known gaps
 
 - No external audit.
+- **Whitelisted assets:** token-contract behavior is trusted, a compromised pauser can cause a pause-based denial of service, and removing an asset with funds can make those funds inaccessible until it is re-whitelisted. These are open risks tracked in [#263](https://github.com/tonyy-starrk/ourdao-contracts/issues/263); see the threat table for operational mitigations.
 - Fixed membership fee and no reveal deadline on private proposals are tracked as separate issues (#47, #48).
 - Testnet-only deploy tooling.
 - Admin-key custody and rotation are operational concerns outside the contract.
