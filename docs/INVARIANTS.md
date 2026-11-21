@@ -9,9 +9,24 @@ for the process.
 
 ---
 
+## Per-asset scope
+
+The DAO can hold multiple whitelisted assets, but member capital and rewards
+are not tracked independently per asset. Use these scopes when reconciling the
+treasury:
+
+| Quantity | Asset scope |
+|---|---|
+| Actual token balance and outstanding loan principal | Tracked separately for each asset. |
+| Spendable treasury | Per asset: token balance minus stake held in that asset. Stake exists only in the base token, so a non-base asset's spendable balance is its full token balance. |
+| Member contribution, stake, exit share, and claimable yield | Base token only. Interest repaid in a non-base asset remains in that asset's treasury and is not distributed as member yield. |
+
 ## Accounting invariants
 
 ### A1 — Distributed interest never exceeds collected interest
+**Asset scope:** Base token only. Repaid interest in any non-base asset stays in
+that asset's treasury and does not enter the member-yield accumulator.
+
 **Statement:** The sum of `get_pending_yield(m)` across all active members is
 less than or equal to the total `interest` passed to `distribute_interest`.
 Specifically, each member receives exactly `interest / active_members` and the
@@ -26,6 +41,9 @@ Any future rebate or discount mechanism (such as ADR-0008 early repayment discou
 ---
 
 ### A2 — Exit shares never exceed the treasury
+**Asset scope:** Base token only. Members have no pro-rata exit claim on
+non-base asset balances.
+
 **Statement:** `calculate_exit_share(m)` is bounded by `m.contribution / total_contributions
 * treasury_balance`. The sum of all members' exit shares is therefore bounded by the
 total treasury, so paying out every member simultaneously can never leave the
@@ -36,9 +54,15 @@ treasury in deficit.
 
 ---
 
-### A3 — Treasury balance excludes staked principal
-**Statement:** `treasury_balance` is defined as `token.balance(contract) - total_staked`.
-Staked tokens are never counted as lendable or distributable treasury.
+### A3 — Base-token treasury excludes staked principal
+**Asset scope:** Base token only for the stake subtraction. For each non-base
+asset, `staked` is zero and its full token balance is spendable treasury.
+
+**Statement:** The base-token `treasury_balance` is defined as
+`token.balance(contract) - total_staked`. Staked base tokens are never counted
+as lendable or distributable treasury. Per asset, `get_treasury_accounting`
+reports `token_balance`, `staked`, and `outstanding_principal`; the spendable
+balance is `token_balance - staked`.
 
 **Tested:** ⚠️ Covered implicitly by staking tests, but no dedicated invariant
 property test exists. Tracking issue: open as follow-up (#134).
@@ -46,6 +70,8 @@ property test exists. Tracking issue: open as follow-up (#134).
 ---
 
 ### A4 — Total contributions counter consistency
+**Asset scope:** Base-token member contributions.
+
 **Statement:** The internal `TotalContributions` counter must equal the sum of
 `member.contribution` across all active members.
 
@@ -59,6 +85,8 @@ inconsistency; tracking issue: open as follow-up (#134).
 ---
 
 ### A5 — Outstanding principal per asset matches the active loans in it
+**Asset scope:** Every asset; each loan is accounted against its own asset.
+
 **Statement:** For every asset, `get_treasury_accounting(asset).outstanding_principal`
 equals the principal still owed on `Active` loans denominated in that asset.
 Repayments cover interest first, so a loan owes
@@ -81,6 +109,9 @@ direct transfer to the contract, is drift.
 ---
 
 ### A6 — A default slashes the base-token contribution, whatever the loan's asset
+**Asset scope:** The penalty and member claim are base-token amounts; the
+written-off principal is accounted in the loan's asset.
+
 **Statement:** `mark_loan_defaulted` behaves the same for a loan in a non-base
 asset as for a base-token loan:
 
@@ -105,6 +136,9 @@ asset as for a base-token loan:
 ## Lifecycle invariants
 
 ### L1 — `loan_id == proposal_id`
+**Asset scope:** Every loan asset; the shared identifier is independent of
+the loan denomination.
+
 **Statement:** Every `Loan` record has the same `id` as the `LoanProposal` that
 created it. This identity is used by the storage layer and `schema.sql` downstream
 to join the two tables without a separate foreign-key column.
@@ -117,6 +151,9 @@ named invariant test. Tracking issue: open as follow-up (#134).
 ---
 
 ### L2 — A member with `has_active_loan` has exactly one `Active` loan
+**Asset scope:** Every asset; the member's active-loan status covers loans in
+any denomination.
+
 **Statement:** `member.has_active_loan == true` if and only if exactly one loan
 record with `status == LoanStatus::Active` exists for that member's address.
 
@@ -126,6 +163,8 @@ Tracking issue: open as follow-up (#134).
 ---
 
 ### L3 — `active_members <= total_members`
+**Asset scope:** Asset-neutral; this invariant concerns member counts.
+
 **Statement:** `get_active_members()` is always less than or equal to
 `get_total_members()`. `total_members` counts exits and inactive members;
 `active_members` counts only `MemberStatus::ActiveMember` records.
@@ -136,6 +175,8 @@ Tracking issue: open as follow-up (#134).
 ---
 
 ### L4 — `total_staked == sum of member stakes`
+**Asset scope:** Base token only; staking is not available for other assets.
+
 **Statement:** `get_total_staked()` equals the sum of `storage::get_stake(m)`
 across all members. The two must stay in sync on every `stake` / `unstake`
 call.
@@ -148,6 +189,8 @@ Tracking issue: open as follow-up (#134).
 ## Governance invariants
 
 ### G1 — Voting weight stays in `[1, 6]`
+**Asset scope:** Stake-based weight uses base-token stake only.
+
 **Statement:** `voting_weight(m)` is always in the range `[1, MAX_STAKE_BONUS + 1]`
 (`[1, 6]`). One base vote per active member, plus a square-root boost of up to
 `MAX_STAKE_BONUS` (5) bonus votes (#182).
@@ -159,6 +202,8 @@ Tracking issue: open as follow-up (#134).
 ---
 
 ### G2 — Voting weight is monotonic in stake
+**Asset scope:** Base-token stake only.
+
 **Statement:** More stake never reduces voting weight:
 `stake_a <= stake_b ⟹ voting_weight(a) <= voting_weight(b)`.
 
@@ -168,6 +213,10 @@ Tracking issue: open as follow-up (#134).
 ---
 
 ### G3 — Interest rate stays within policy bounds
+**Asset scope:** The rate formula is asset-agnostic; each loan uses the
+treasury balance of its own asset. The public quote helper reports the
+base-token case.
+
 **Statement:** `calculate_loan_terms(amount).interest_rate` is always in
 `[policy.min_interest_rate, policy.max_interest_rate]`, for any `amount` and
 any treasury size.
@@ -178,6 +227,8 @@ any treasury size.
 ---
 
 ### G4 — The stake boost is quadratic and capped
+**Asset scope:** Base-token stake only.
+
 **Statement:** `stake_boost(s) == min(isqrt(s / STAKE_WEIGHT_UNIT), MAX_STAKE_BONUS)`,
 i.e. `k` bonus votes cost `STAKE_WEIGHT_UNIT * k * k` staked tokens
 (100 / 400 / 900 / 1600 / 2500). Consequences that must keep holding:
@@ -199,6 +250,9 @@ i.e. `k` bonus votes cost `STAKE_WEIGHT_UNIT * k * k` staked tokens
 ## Rounding invariants
 
 ### R1 — Rounding direction favours the treasury
+**Asset scope:** Loan amounts and balances use each loan's own asset. Member
+stakes, exit payouts, and yield are base-token-only.
+
 **Statement:** Every division site across the contracts is explicitly specified so that
 rounding favours the DAO treasury:
 - **Member debts and penalties round UP (ceil division):** Borrowers pay at least the
