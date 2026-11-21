@@ -17,24 +17,68 @@ There is no way around the core trust tradeoff this creates: **whoever runs a mi
 
 ## State inventory
 
-Every category of state a migration must carry, and where it comes from. "View" means read live from the old contract before it's decommissioned. "Event" means reconstructible from `ourdao-backend`'s indexed event log even after the old contract is gone. Where a category needs both — a view to get the *current* value, an event stream to get the *set of addresses/ids to query* — both are listed.
+Every `DataKey` variant in `contracts/dao/src/storage.rs` is accounted for
+below. "View" means read live from the old contract before it is decommissioned.
+"Event" means reconstructible from `ourdao-backend`'s indexed event log. Where
+the contract has no public view, the table says so and identifies whether a
+view is needed or the state is derived/excluded. Where an event supplies the
+address/id set and a view supplies its current value, both are listed.
 
-| State | Read source | Notes |
+| `DataKey` variant(s) | Read source | Notes |
 |---|---|---|
-| Admin set | View: `get_admins()` | Fully enumerable directly — no event replay needed. |
-| Consensus threshold | View: `get_consensus_threshold()` | |
-| Loan policy | View: `get_loan_policy()` | |
-| Token | View: `get_token()` | Decide up front whether the new deployment keeps the same asset. |
-| Member addresses | View: `list_members(start, limit)`, paged; cross-check against `joined` events (and `exited` for status) | `list_members` skips members whose storage has expired, so the address set must also be checked against replaying `joined` events. `get_total_members`/`get_active_members` return only counts. Current status/fields come from the view below. |
-| Member record (status, join_ledger, contribution, share_balance, has_active_loan, last_loan_time) | View: `get_member(address)`, per address from the set above | |
-| Stakes | View: `get_stake(address)`, per address (from `staked`/`unstaked` events or the member-address set) | |
-| Pending yield | View: `get_pending_yield(address)`, per address — **must be read live** | **Reconstructible from `exit_dao` events** — the event now emits `(member, share, pending)` so members can recover pending yield from the event log even after the old contract is decommissioned. If a member's entry has expired (see [TTL risk](#ttl--state-archival-risk)) before this is read, their pending yield may still be unrecoverable — accept and document it as a loss for that member rather than guessing. |
-| Active loans + outstanding balance | View: `get_loan(loan_id)`, per id (ids from `loan_req`/`loan_appr` events) | `amount_repaid` and `status` on the struct give the exact outstanding balance, including for partially-repaid loans. |
-| In-flight loan/treasury proposals | View: `get_loan_proposal(id)` / `get_treasury_proposal(id)`, per id (ids from `loan_req`/`tre_prop` events) | See [mid-vote handling](#edge-cases-mid-migration-loans-and-proposals) — the recommendation is *not* to carry these over. |
-| Name registry entries | View: `resolve_name(name)` / `name_of(owner)`, per name (from `name_reg` events) | |
-| Attached document hashes | View: `get_document(kind, id)`, per `(kind, id)` pair (from `doc_attn` events) | Only the hash is on-chain; the underlying content already lives off-chain (IPFS or similar) and needs no migration itself. |
+| `Admins` | View: `get_admins()` | Fully enumerable. |
+| `Threshold` | View: `get_consensus_threshold()` | |
+| `MembershipFee` | Event: `init` | Included in initialization event, but there is no public getter; add `get_membership_fee()` for a direct state read. |
+| `Token` | View: `get_token()` | The configured base asset; decide whether the new deployment keeps it. |
+| `Policy` | View: `get_loan_policy()` | Includes all `LoanPolicy` fields. |
+| `Paused` | View: `is_paused()` or `get_dao_summary()` | The old deployment remains paused after migration. |
+| `Pauser` | Events: `pset`, `prev` | No public getter; replay events for the current assignment and add `get_pauser()` for direct verification. The new contract's seed configuration must also include the assignment. |
+| `PendingPolicyUpdate` | View: `get_pending_policy_update()` | Capture pending policy and execution time, or cancel/resolve it before migration. |
+| `Members`, `TotalMembers`, `ActiveMembers` | Views: `list_members(start, limit)`, `get_total_members()`, `get_active_members()`; events: `joined`, `exited` | Page the list and cross-check its address set against events. `list_members` skips records whose storage expired. |
+| `Member` | View: `get_member(address)`; also `get_member_loan_stats(address)` / `get_member_overview(address)` | Per member. The member record includes lifetime loan counts and active-loan status; use the overview when collecting related member fields. |
+| `TotalContributions` | No public view; recompute from member records if needed | This legacy counter is not used by current exit calculations and is not maintained as an authoritative total; exclude it from the seed. |
+| `ActiveContributions` | No public view; derive from active `Member.contribution` values | Required for exit-share calculations. Recompute it from seeded active members; add a getter so the result can be verified before unlocking. |
+| `NextProposalId`, `NextTreasuryId` | Views: `get_loan_proposal_count()`, `get_treasury_proposal_count()` | These counts are the next ids because ids are allocated from zero. |
+| `LoanProposal` | View: `get_loan_proposal(id)`; events: `loan_req` and proposal lifecycle events | In-flight proposals are recommended to lapse and be resubmitted, not seeded. |
+| `Loan` | View: `get_loan(id)`; ids from `loan_req` / `loan_appr` events | `amount_repaid` and `status` give the outstanding balance. |
+| `TreasuryProposal` | View: `get_treasury_proposal(id)`; ids from `tre_prop` events | In-flight proposals are recommended to lapse and be resubmitted, not seeded. |
+| `LoanAsset` | Event: `loan_asst`; base token is the default when no asset was recorded | No public asset getter; add `get_loan_asset(id)`. The current `seed_loans` design also needs to carry the asset if active loans are migrated. |
+| `TreasuryAsset` | Event: `tre_asset`; base token is the default when no asset was recorded | No public asset getter; add `get_treasury_asset(id)`. If a treasury proposal is ever migrated, its seed format must carry the asset too. |
+| `LoanVoted`, `TreasuryVoted` | View: `has_voted(kind, proposal_id, voter)`; events: `loan_vote`, `tre_vote` | Do not seed vote records when the associated in-flight proposals are allowed to lapse. |
+| `Commit` | Event: `committed`; no public view of the commitment value | Exclude with its in-flight private treasury proposal; do not migrate partial commit-reveal state. |
+| `Stake`, `TotalStaked` | Views: `get_stake(address)`, `get_dao_summary().total_staked`; events: `staked`, `unstaked` | Stake is base-token-only. Read each member's amount and reconcile the sum with the total. |
+| `StakeTime` | Event: latest `staked` event for the member (use its ledger timestamp) | No public getter; add `get_stake_time(address)` and include the timestamp in stake seeding. It gates unstaking cooldowns and cannot be recovered from `get_stake()` alone. |
+| `PendingYield` | View: `get_pending_yield(address)`; `exited` event as a historical cross-check | Read the computed claim live; do not copy this legacy key independently. If storage has expired, document any unrecoverable claim rather than guessing. |
+| `YieldAccumulator`, `MemberYieldSnapshot` | View: `get_pending_yield(address)` per member | Internal implementation detail; seed the computed pending amount with `seed_pending_yield` and a fresh accumulator as described below, rather than copying these keys. |
+| `YieldRemainder` | No public view or event value | Base-token interest remainder rolls into later distributions. Add a getter and seed support to preserve it exactly; it is not included in any member's current pending yield. |
+| `OpenProposals` | Derived by scanning proposal records; no public getter | Recompute on the new contract. Since in-flight proposals are not migrated, do not seed this cache. |
+| `Doc` | View: `get_document(kind, id)`; ids from `doc_attn` events | Only the hash is on-chain; the underlying content needs no migration. |
+| `Name`, `NameOf` | Views: `resolve_name(name)`, `name_of(owner)`; names/owners from `name_reg` events | Neither view enumerates all names. Include names held by non-members from the event index. |
+| `Delegation` | View: `get_delegate(delegator)` or `get_member_overview(address)`; event: `delegate` | A direct view exists; read per member. Add a `seed_delegations` step to the migration design. |
+| `TokenWhitelisted`, `WhitelistedTokens` | Views: `is_token_whitelisted(token)`, `get_whitelisted_tokens()`; events: `tok_add`, `tok_rem` | The base token is implicitly whitelisted; the list view returns it first. Keep removed assets in the historical candidate set. Add a whitelist seeding step for the extra assets. |
+| `PendingTokenAddition` | View: `get_pending_token_addition(token)`; candidate addresses from `tok_prop` events | Read for every token proposed for addition; do not carry pending additions over. Re-propose after migration if still wanted. |
+| `MigrationSeedingLocked` | View: `is_seeding_locked()` | Record the old contract's lock state; the new deployment must remain unlocked until verification is complete. |
+| `OutstandingPrincipal` | View: `get_treasury_accounting(asset)` per asset | Reconcile against active loans in that asset; zero after all loans in that asset are repaid or defaulted. |
+| External token balance (not a `DataKey`) | View: `get_treasury_accounting(asset).token_balance` | Read for every current or historically removed asset; use whitelist (`tok_add`, `tok_rem`) and loan/proposal asset events to enumerate candidates. The view also reports stake and outstanding principal. |
 
-One structural note that falls out of this table: **names can only be read per name or per owner address**, so a name held by an address that is no longer a member has to come from the event log. Member addresses and loan, proposal and document ids can be enumerated from the live contract (`list_members` and the proposal counters). The event log is still the independent cross-check on all of them. If `ourdao-backend` has not been running continuously since deployment, that cross-check is missing and this procedure cannot be completed — see the RPC caveat below.
+This table intentionally distinguishes public views from internal storage
+accessors. In particular, delegation already has `get_delegate()`; it does not
+need a new view, although the seed design needs to include it. Add public views
+for `MembershipFee`, `Pauser`, `ActiveContributions`, loan/treasury proposal
+assets, `StakeTime`, and `YieldRemainder` before relying on direct on-chain
+reads of those values. The seed design must also carry pauser assignment,
+whitelisted assets, delegation, stake timestamps, loan/proposal asset metadata,
+and yield remainder. `TotalContributions`, vote/commit records, and
+`OpenProposals` are explicitly excluded or derived as noted above.
+
+One structural note: **names can only be read per name or per owner address**,
+so a name held by an address that is no longer a member has to come from the
+event log. Member addresses and loan, proposal and document ids can be
+enumerated from the live contract (`list_members` and the proposal counters).
+The event log is still the independent cross-check on all of them. If
+`ourdao-backend` has not been running continuously since deployment, that
+cross-check is missing and this procedure cannot be completed — see the RPC
+caveat below.
 
 > Public Soroban RPC retains only ~24h of ledger history. "Just replay the event log" is only possible because `ourdao-backend` has (assumed) been indexing continuously since deployment into its own durable store — RPC itself is not that store.
 
